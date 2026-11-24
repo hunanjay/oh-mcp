@@ -1,4 +1,5 @@
 node_modules/
 dist/
+.oh-mcp/
 .DS_Store
 *.log

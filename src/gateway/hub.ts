@@ -5,6 +5,8 @@ import {
   type McpToolDefinition,
   type NormalizedToolResult,
 } from '../protocol/jsonrpc.js'
+import type { GatewayServerEntry } from '../config.js'
+import type { GatewayStorage } from '../storage/sqlite.js'
 import type { UpstreamServer, UpstreamStatus } from '../upstream/base.js'
 
 export type ExposureMode = 'eager' | 'lazy'
@@ -180,8 +182,9 @@ export class McpHub {
   private readonly apiKeys = new Map<string, { record: GatewayApiKeyRecord; rawKey: string }>()
   private readonly maxLogs = 300
   readonly startedAt = Date.now()
+  private readonly enabledFlags = new Map<string, boolean>()
 
-  constructor() {
+  constructor(private readonly storage?: GatewayStorage) {
     // Seed a default connected client entry for OpenHarness local control plane
     const now = Date.now()
     this.clients.set('openharness-local', {
@@ -193,9 +196,35 @@ export class McpHub {
       lastSeenAt: now,
       requestCount: 0,
     })
+
+    if (storage) {
+      for (const [tool, policy] of Object.entries(storage.loadPolicies())) {
+        this.toolPolicies.set(tool, policy)
+      }
+      for (const key of storage.loadApiKeys()) {
+        this.apiKeys.set(key.id, {
+          record: {
+            id: key.id,
+            name: key.name,
+            prefix: key.prefix,
+            createdAt: key.createdAt,
+            ...(key.lastUsedAt !== undefined ? { lastUsedAt: key.lastUsedAt } : {}),
+          },
+          rawKey: key.rawKey,
+        })
+      }
+      for (const log of storage.loadLogs(this.maxLogs)) {
+        this.logs.push(log)
+      }
+    }
   }
 
-  register(server: UpstreamServer, options: UpstreamRegistrationOptions = {}, config?: Readonly<Record<string, unknown>>): this {
+  register(
+    server: UpstreamServer,
+    options: UpstreamRegistrationOptions = {},
+    config?: Readonly<Record<string, unknown>>,
+    persist = true,
+  ): this {
     if (!/^[a-zA-Z0-9_-]+$/.test(server.name)) {
       throw new Error(`Invalid upstream server name "${server.name}": must match /^[a-zA-Z0-9_-]+$/`)
     }
@@ -206,6 +235,7 @@ export class McpHub {
       for (const [tName, policy] of Object.entries(options.toolPolicies)) {
         const key = tName.includes('__') ? tName : formatNamespacedTool(server.name, tName)
         this.toolPolicies.set(key, policy)
+        this.storage?.setPolicy(key, policy)
       }
     }
     this.upstreams.set(server.name, {
@@ -216,7 +246,40 @@ export class McpHub {
       errorCount: 0,
       totalLatencyMs: 0,
     })
+    if (!this.enabledFlags.has(server.name)) {
+      this.enabledFlags.set(server.name, true)
+    }
+    if (persist) {
+      this.persistServer(server.name)
+    }
     return this
+  }
+
+  setServerEnabledFlag(name: string, enabled: boolean): void {
+    this.enabledFlags.set(name, enabled)
+  }
+
+  isServerEnabled(name: string): boolean {
+    return this.enabledFlags.get(name) ?? true
+  }
+
+  private persistServer(name: string): void {
+    if (!this.storage) return
+    const entry = this.upstreams.get(name)
+    if (!entry?.config) return
+    const cfg = entry.config as GatewayServerEntry
+    const merged: GatewayServerEntry = {
+      ...cfg,
+      mode: entry.options.mode ?? 'eager',
+      ...(entry.options.allowTools ? { allowTools: entry.options.allowTools } : {}),
+      ...(entry.options.denyTools ? { denyTools: entry.options.denyTools } : {}),
+    }
+    this.storage.upsertServer({
+      name,
+      entry: merged,
+      enabled: this.isServerEnabled(name),
+      updatedAt: Date.now(),
+    })
   }
 
   recordClientActivity(clientName: string, protocol: 'rest' | 'mcp-jsonrpc', userAgent = ''): void {
@@ -258,6 +321,7 @@ export class McpHub {
       createdAt: Date.now(),
     }
     this.apiKeys.set(id, { record, rawKey: token })
+    this.storage?.upsertApiKey({ ...record, rawKey: token })
     return { record, token }
   }
 
@@ -266,7 +330,9 @@ export class McpHub {
   }
 
   deleteApiKey(id: string): boolean {
-    return this.apiKeys.delete(id)
+    const deleted = this.apiKeys.delete(id)
+    if (deleted) this.storage?.deleteApiKey(id)
+    return deleted
   }
 
   listLogs(limit = 100): GatewayCallLog[] {
@@ -275,6 +341,7 @@ export class McpHub {
 
   setToolPolicy(namespacedTool: string, policy: PolicyAction): void {
     this.toolPolicies.set(namespacedTool, policy)
+    this.storage?.setPolicy(namespacedTool, policy)
   }
 
   getToolPolicy(namespacedTool: string): PolicyAction {
@@ -288,6 +355,8 @@ export class McpHub {
   async connectServer(name: string, signal?: AbortSignal): Promise<GatewayServerStatus> {
     const entry = this.upstreams.get(name)
     if (!entry) throw new Error(`MCP server "${name}" is not registered`)
+    this.setServerEnabledFlag(name, true)
+    this.persistServer(name)
     const started = performance.now()
     try {
       await entry.server.connect(signal)
@@ -301,6 +370,8 @@ export class McpHub {
   async disconnectServer(name: string): Promise<GatewayServerStatus> {
     const entry = this.upstreams.get(name)
     if (!entry) throw new Error(`MCP server "${name}" is not registered`)
+    this.setServerEnabledFlag(name, false)
+    this.persistServer(name)
     await entry.server.close()
     return this.getServerStatus(name)!
   }
@@ -310,6 +381,8 @@ export class McpHub {
     if (!entry) return false
     await entry.server.close()
     this.upstreams.delete(name)
+    this.enabledFlags.delete(name)
+    this.storage?.deleteServer(name)
     return true
   }
 
@@ -326,8 +399,10 @@ export class McpHub {
       for (const [tool, policy] of Object.entries(patch.toolPolicies)) {
         const key = tool.includes('__') ? tool : formatNamespacedTool(name, tool)
         this.toolPolicies.set(key, policy)
+        this.storage?.setPolicy(key, policy)
       }
     }
+    this.persistServer(name)
     return this.getServerStatus(name)!
   }
 
@@ -351,9 +426,11 @@ export class McpHub {
 
   async connectAll(signal?: AbortSignal): Promise<GatewayServerStatus[]> {
     await Promise.allSettled(
-      [...this.upstreams.keys()].map(async name => {
-        await this.connectServer(name, signal)
-      }),
+      [...this.upstreams.keys()]
+        .filter(name => this.isServerEnabled(name))
+        .map(async name => {
+          await this.connectServer(name, signal)
+        }),
     )
     return this.listServers()
   }
@@ -560,7 +637,7 @@ export class McpHub {
     isError: boolean,
     output: string,
   ): void {
-    this.logs.unshift({
+    const logEntry: GatewayCallLog = {
       id: `req_${randomUUID().slice(0, 8)}`,
       timestamp: Date.now(),
       client,
@@ -571,10 +648,12 @@ export class McpHub {
       durationMs: Math.max(1, Math.round(durationMs)),
       isError,
       preview: output.length > 240 ? `${output.slice(0, 240)}...` : output,
-    })
+    }
+    this.logs.unshift(logEntry)
     if (this.logs.length > this.maxLogs) {
       this.logs.length = this.maxLogs
     }
+    this.storage?.appendLog(logEntry)
   }
 
   async closeAll(): Promise<void> {

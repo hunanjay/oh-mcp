@@ -76,6 +76,8 @@ export function createGatewayServer(hub: McpHub): Server {
         registerServerFromEntry(hub, body.name, body)
         if (body.connect !== false) {
           await hub.connectServer(body.name)
+        } else {
+          await hub.disconnectServer(body.name)
         }
         sendJson(res, 200, { servers: hub.listServers() })
         return

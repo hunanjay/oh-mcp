@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest'
 import {
   HttpUpstream,
   McpHub,
+  SqliteGatewayStorage,
   StdioUpstream,
   createHubFromConfig,
   normalizeMcpResult,
+  registerServerFromEntry,
 } from '../src/index.js'
 
 const MOCK_STDIO_SERVER_SCRIPT = `
@@ -242,6 +244,38 @@ describe('oh-mcp McpHub & Upstreams', () => {
       expect(callRes).toEqual({ content: 'stdio:via-meta-tool' })
     } finally {
       await hub.closeAll()
+    }
+  })
+
+  it('persists servers, policies, api keys, and call logs in SqliteGatewayStorage across restarts', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const dir = mkdtempSync(join(tmpdir(), 'oh-mcp-sqlite-'))
+    const dbPath = join(dir, 'gateway.db')
+
+    try {
+      const storage1 = new SqliteGatewayStorage(dbPath)
+      const hub1 = createHubFromConfig({ mcpServers: {} }, storage1)
+      registerServerFromEntry(hub1, 'mem_http', { url: 'https://example.test/mcp', mode: 'lazy' })
+      hub1.setToolPolicy('mem_http__ping', 'deny')
+      const { record } = hub1.createApiKey('CI Agent')
+      await hub1.disconnectServer('mem_http')
+      await hub1.closeAll()
+      storage1.close()
+
+      const storage2 = new SqliteGatewayStorage(dbPath)
+      const hub2 = createHubFromConfig({ mcpServers: {} }, storage2)
+      expect(hub2.listServers()).toMatchObject([
+        { name: 'mem_http', transport: 'http', mode: 'lazy', state: 'registered' },
+      ])
+      expect(hub2.isServerEnabled('mem_http')).toBe(false)
+      expect(hub2.getToolPolicy('mem_http__ping')).toBe('deny')
+      expect(hub2.listApiKeys().map(k => k.id)).toEqual([record.id])
+      await hub2.closeAll()
+      storage2.close()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
     }
   })
 })
