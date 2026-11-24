@@ -1,0 +1,217 @@
+import { describe, expect, it } from 'vitest'
+import {
+  HttpUpstream,
+  McpHub,
+  StdioUpstream,
+  createHubFromConfig,
+  normalizeMcpResult,
+} from '../src/index.js'
+
+const MOCK_STDIO_SERVER_SCRIPT = `
+import { createInterface } from 'node:readline';
+const rl = createInterface({ input: process.stdin });
+rl.on('line', line => {
+  const msg = JSON.parse(line);
+  if (!('id' in msg)) return;
+  if (msg.method === 'initialize') {
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: msg.id,
+      result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'mock-stdio', version: '1.0.0' } }
+    }) + '\\n');
+  } else if (msg.method === 'tools/list') {
+    process.stdout.write(JSON.stringify({
+      jsonrpc: '2.0',
+      id: msg.id,
+      result: {
+        tools: [
+          {
+            name: 'echo',
+            description: 'Echo text back',
+            inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] }
+          },
+          {
+            name: 'secret_tool',
+            description: 'Hidden tool',
+            inputSchema: { type: 'object', properties: {} }
+          }
+        ]
+      }
+    }) + '\\n');
+  } else if (msg.method === 'tools/call') {
+    const { name, arguments: args } = msg.params;
+    if (name === 'echo') {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: { content: [{ type: 'text', text: 'stdio:' + (args?.text ?? '') }] }
+      }) + '\\n');
+    } else {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: { content: [{ type: 'text', text: 'unknown tool' }], isError: true }
+      }) + '\\n');
+    }
+  }
+});
+`
+
+describe('oh-mcp McpHub & Upstreams', () => {
+  it('aggregates stdio and http upstreams, enforces tool filters, and routes calls by namespace', async () => {
+    const stdioServer = new StdioUpstream({
+      name: 'local',
+      command: process.execPath,
+      args: ['--input-type=module', '-e', MOCK_STDIO_SERVER_SCRIPT],
+    })
+
+    const mockFetch: typeof fetch = async (_input, init) => {
+      const rpc = JSON.parse(String(init?.body ?? '{}')) as { id: number; method: string; params?: Record<string, unknown> }
+      if (rpc.method === 'initialize') {
+        return new Response(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: rpc.id,
+            result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'remote', version: '1.0' } },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json', 'mcp-session-id': 'sess-1' } },
+        )
+      }
+      if (rpc.method === 'tools/list') {
+        return new Response(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: rpc.id,
+            result: {
+              tools: [
+                {
+                  name: 'search',
+                  description: 'Search remote docs',
+                  inputSchema: { type: 'object', properties: { q: { type: 'string' } }, required: ['q'] },
+                },
+              ],
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      if (rpc.method === 'tools/call') {
+        const params = rpc.params as { name: string; arguments: { q?: string } }
+        return new Response(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: rpc.id,
+            result: { content: [{ type: 'text', text: `http:${params.arguments.q ?? ''}` }] },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      return new Response('Not found', { status: 404 })
+    }
+
+    const httpServer = new HttpUpstream({
+      name: 'docs',
+      url: 'https://mcp.example.test/mcp',
+      fetchImpl: mockFetch,
+    })
+
+    const hub = new McpHub()
+      .register(stdioServer, { denyTools: ['secret_tool'] })
+      .register(httpServer)
+
+    try {
+      const statuses = await hub.connectAll()
+      expect(statuses).toEqual([
+        { name: 'local', transport: 'stdio', connected: true, toolCount: 2, mode: 'eager' },
+        { name: 'docs', transport: 'http', connected: true, toolCount: 1, mode: 'eager' },
+      ])
+
+      const tools = await hub.listTools()
+      expect(tools.map(t => t.name)).toEqual(['local__echo', 'docs__search'])
+
+      expect(await hub.callTool('local__echo', { text: 'hello' })).toEqual({
+        content: 'stdio:hello',
+      })
+      expect(await hub.callTool('docs__search', { q: 'openharness' })).toEqual({
+        content: 'http:openharness',
+      })
+
+      // Denied tool cannot be called even directly
+      expect(await hub.callTool('local__secret_tool', {})).toEqual({
+        content: 'Tool "secret_tool" is denied on server "local"',
+        isError: true,
+      })
+
+      // Invalid namespace or server returns structured error
+      expect(await hub.callTool('invalid_name', {})).toMatchObject({ isError: true })
+      expect(await hub.callTool('missing__tool', {})).toMatchObject({ isError: true })
+    } finally {
+      await hub.closeAll()
+    }
+  })
+
+  it('normalizes text, resource, and unsupported MCP content blocks', () => {
+    expect(
+      normalizeMcpResult({
+        content: [
+          { type: 'text', text: 'line 1' },
+          { type: 'resource', resource: { uri: 'file:///a.txt', text: 'resource text' } },
+          { type: 'resource', resource: { uri: 'file:///img.png', mimeType: 'image/png' } },
+          { type: 'image', data: 'base64...' },
+        ],
+        isError: true,
+      }),
+    ).toEqual({
+      content: 'line 1\nresource text\n[MCP binary resource: file:///img.png (image/png)]\n[Unsupported MCP content block: image]',
+      isError: true,
+    })
+  })
+
+  it('builds a hub from declarative config', () => {
+    const hub = createHubFromConfig({
+      mcpServers: {
+        remote_api: { url: 'https://example.test/mcp', allowTools: ['ping'], mode: 'lazy' },
+      },
+    })
+    expect(hub.listServers()).toEqual([
+      { name: 'remote_api', transport: 'http', connected: false, toolCount: 0, mode: 'lazy' },
+    ])
+  })
+
+  it('supports lazy exposure mode via mcp_list_tools, mcp_describe_tool, and mcp_call_tool', async () => {
+    const stdioServer = new StdioUpstream({
+      name: 'heavy',
+      command: process.execPath,
+      args: ['--input-type=module', '-e', MOCK_STDIO_SERVER_SCRIPT],
+    })
+    const hub = new McpHub().register(stdioServer, { mode: 'lazy', denyTools: ['secret_tool'] })
+    try {
+      await hub.connectAll()
+      // Active tools list only contains the 3 meta-tools, saving context window
+      const activeTools = await hub.listTools()
+      expect(activeTools.map(t => t.name)).toEqual(['mcp_list_tools', 'mcp_describe_tool', 'mcp_call_tool'])
+
+      // 1. Discover via mcp_list_tools
+      const listRes = await hub.callTool('mcp_list_tools', { query: 'echo' })
+      expect(listRes.content).toContain('heavy__echo (lazy): [heavy] Echo text back')
+
+      // 2. Inspect schema via mcp_describe_tool
+      const descRes = await hub.callTool('mcp_describe_tool', { name: 'heavy__echo' })
+      expect(JSON.parse(descRes.content)).toMatchObject({
+        name: 'heavy__echo',
+        server: 'heavy',
+        originalName: 'echo',
+        mode: 'lazy',
+      })
+
+      // 3. Call lazy tool via mcp_call_tool
+      const callRes = await hub.callTool('mcp_call_tool', {
+        name: 'heavy__echo',
+        arguments: { text: 'via-meta-tool' },
+      })
+      expect(callRes).toEqual({ content: 'stdio:via-meta-tool' })
+    } finally {
+      await hub.closeAll()
+    }
+  })
+})
