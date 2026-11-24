@@ -87,8 +87,9 @@ export class StdioUpstream implements UpstreamServer {
       this.lastError = undefined
       await this.listTools(signal)
     } catch (error) {
-      this.lastError = error instanceof Error ? error.message : String(error)
+      const errMsg = error instanceof Error ? error.message : String(error)
       await this.close()
+      this.lastError = errMsg
       throw error
     }
   }
@@ -110,9 +111,11 @@ export class StdioUpstream implements UpstreamServer {
   }
 
   status(): UpstreamStatus {
+    const state = this.connected ? 'active' : this.lastError ? 'failed' : 'registered'
     return {
       name: this.name,
       transport: this.transport,
+      state,
       connected: this.connected,
       toolCount: this.cachedTools.length,
       ...(this.lastError ? { lastError: this.lastError } : {}),
@@ -121,6 +124,7 @@ export class StdioUpstream implements UpstreamServer {
 
   async close(): Promise<void> {
     this.connected = false
+    this.lastError = undefined
     this.rl?.close()
     this.rl = undefined
     this.failAllPending(new Error(`Stdio MCP server "${this.name}" closed`))

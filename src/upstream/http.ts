@@ -69,9 +69,11 @@ export class HttpUpstream implements UpstreamServer {
   }
 
   status(): UpstreamStatus {
+    const state = this.connected ? 'active' : this.lastError ? 'failed' : 'registered'
     return {
       name: this.name,
       transport: this.transport,
+      state,
       connected: this.connected,
       toolCount: this.cachedTools.length,
       ...(this.lastError ? { lastError: this.lastError } : {}),
@@ -80,6 +82,7 @@ export class HttpUpstream implements UpstreamServer {
 
   async close(): Promise<void> {
     this.connected = false
+    this.lastError = undefined
     this.sessionId = undefined
   }
 

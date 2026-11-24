@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "demo": {
+      "transport": "stdio",
+      "mode": "eager",
+      "command": "node",
+      "args": ["src/demo-server.mjs"]
+    }
+  }
+}

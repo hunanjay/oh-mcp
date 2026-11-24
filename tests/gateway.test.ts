@@ -120,10 +120,13 @@ describe('oh-mcp McpHub & Upstreams', () => {
       .register(httpServer)
 
     try {
+      // Initially in 'registered' state before connect
+      expect(hub.listServers().map(s => s.state)).toEqual(['registered', 'registered'])
+
       const statuses = await hub.connectAll()
-      expect(statuses).toEqual([
-        { name: 'local', transport: 'stdio', connected: true, toolCount: 2, mode: 'eager' },
-        { name: 'docs', transport: 'http', connected: true, toolCount: 1, mode: 'eager' },
+      expect(statuses).toMatchObject([
+        { name: 'local', transport: 'stdio', state: 'active', connected: true, toolCount: 2, mode: 'eager', denyTools: ['secret_tool'] },
+        { name: 'docs', transport: 'http', state: 'active', connected: true, toolCount: 1, mode: 'eager' },
       ])
 
       const tools = await hub.listTools()
@@ -167,15 +170,42 @@ describe('oh-mcp McpHub & Upstreams', () => {
     })
   })
 
-  it('builds a hub from declarative config', () => {
+  it('builds a hub from declarative config and tracks registered -> active / failed / disconnected states', async () => {
     const hub = createHubFromConfig({
       mcpServers: {
         remote_api: { url: 'https://example.test/mcp', allowTools: ['ping'], mode: 'lazy' },
+        broken_stdio: { command: '/nonexistent/binary/for/oh-mcp-test' },
       },
     })
-    expect(hub.listServers()).toEqual([
-      { name: 'remote_api', transport: 'http', connected: false, toolCount: 0, mode: 'lazy' },
+    expect(hub.listServers()).toMatchObject([
+      {
+        name: 'remote_api',
+        transport: 'http',
+        state: 'registered',
+        connected: false,
+        toolCount: 0,
+        mode: 'lazy',
+        allowTools: ['ping'],
+        config: { transport: 'http', url: 'https://example.test/mcp' },
+      },
+      {
+        name: 'broken_stdio',
+        transport: 'stdio',
+        state: 'registered',
+        connected: false,
+        toolCount: 0,
+        mode: 'eager',
+        config: { transport: 'stdio', command: '/nonexistent/binary/for/oh-mcp-test' },
+      },
     ])
+
+    const failedStatus = await hub.connectServer('broken_stdio')
+    expect(failedStatus.state).toBe('failed')
+    expect(failedStatus.lastError).toBeTruthy()
+
+    // Disconnecting resets state back to 'registered'
+    const resetStatus = await hub.disconnectServer('broken_stdio')
+    expect(resetStatus.state).toBe('registered')
   })
 
   it('supports lazy exposure mode via mcp_list_tools, mcp_describe_tool, and mcp_call_tool', async () => {

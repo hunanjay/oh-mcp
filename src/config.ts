@@ -18,38 +18,44 @@ export interface GatewayConfigFile {
   readonly mcpServers: Readonly<Record<string, GatewayServerEntry>>
 }
 
+export function registerServerFromEntry(hub: McpHub, name: string, entry: GatewayServerEntry): void {
+  const filterOpts: UpstreamRegistrationOptions = {
+    ...(entry.mode ? { mode: entry.mode } : {}),
+    ...(entry.allowTools ? { allowTools: entry.allowTools } : {}),
+    ...(entry.denyTools ? { denyTools: entry.denyTools } : {}),
+  }
+  if (entry.transport === 'http' || entry.url) {
+    if (!entry.url) throw new Error(`MCP server "${name}" requires "url" for http transport`)
+    hub.register(
+      new HttpUpstream({
+        name,
+        url: entry.url,
+        ...(entry.headers ? { headers: entry.headers } : {}),
+      }),
+      filterOpts,
+      { transport: 'http', url: entry.url },
+    )
+  } else {
+    if (!entry.command) throw new Error(`MCP server "${name}" requires "command" for stdio transport`)
+    hub.register(
+      new StdioUpstream({
+        name,
+        command: entry.command,
+        ...(entry.args ? { args: entry.args } : {}),
+        ...(entry.cwd ? { cwd: entry.cwd } : {}),
+        ...(entry.env ? { env: entry.env } : {}),
+        ...(entry.timeoutMs !== undefined ? { timeoutMs: entry.timeoutMs } : {}),
+      }),
+      filterOpts,
+      { transport: 'stdio', command: entry.command, ...(entry.args ? { args: entry.args } : {}) },
+    )
+  }
+}
+
 export function createHubFromConfig(config: GatewayConfigFile): McpHub {
   const hub = new McpHub()
   for (const [name, entry] of Object.entries(config.mcpServers ?? {})) {
-    const filterOpts: UpstreamRegistrationOptions = {
-      ...(entry.mode ? { mode: entry.mode } : {}),
-      ...(entry.allowTools ? { allowTools: entry.allowTools } : {}),
-      ...(entry.denyTools ? { denyTools: entry.denyTools } : {}),
-    }
-    if (entry.transport === 'http' || entry.url) {
-      if (!entry.url) throw new Error(`MCP server "${name}" requires "url" for http transport`)
-      hub.register(
-        new HttpUpstream({
-          name,
-          url: entry.url,
-          ...(entry.headers ? { headers: entry.headers } : {}),
-        }),
-        filterOpts,
-      )
-    } else {
-      if (!entry.command) throw new Error(`MCP server "${name}" requires "command" for stdio transport`)
-      hub.register(
-        new StdioUpstream({
-          name,
-          command: entry.command,
-          ...(entry.args ? { args: entry.args } : {}),
-          ...(entry.cwd ? { cwd: entry.cwd } : {}),
-          ...(entry.env ? { env: entry.env } : {}),
-          ...(entry.timeoutMs !== undefined ? { timeoutMs: entry.timeoutMs } : {}),
-        }),
-        filterOpts,
-      )
-    }
+    registerServerFromEntry(hub, name, entry)
   }
   return hub
 }
