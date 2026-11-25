@@ -278,4 +278,74 @@ describe('oh-mcp McpHub & Upstreams', () => {
       rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  it('caches tools/list responses, drains stdio stderr, supports SSE Streamable HTTP, and enforces API keys & origin safety', async () => {
+    let httpToolsListCalls = 0
+    const sseHttpServer = new HttpUpstream({
+      name: 'sse_remote',
+      url: 'https://mcp.example.test/sse',
+      fetchImpl: async (_input, init) => {
+        const rpc = JSON.parse(String(init?.body ?? '{}')) as { id: number; method: string }
+        if (rpc.method === 'initialize') {
+          return new Response(
+            `event: message\ndata: ${JSON.stringify({
+              jsonrpc: '2.0',
+              id: rpc.id,
+              result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'sse', version: '1.0' } },
+            })}\n\n`,
+            { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+          )
+        }
+        if (rpc.method === 'tools/list') {
+          httpToolsListCalls++
+          return new Response(
+            `event: message\ndata: ${JSON.stringify({
+              jsonrpc: '2.0',
+              id: rpc.id,
+              result: { tools: [{ name: 'ping', description: 'Ping via SSE', inputSchema: { type: 'object', properties: {} } }] },
+            })}\n\n`,
+            { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+          )
+        }
+        return new Response('Not Found', { status: 404 })
+      },
+    })
+
+    const noisyStderrScript = `
+      for (let i = 0; i < 100; i++) {
+        process.stderr.write('log-line-' + i + ':' + 'x'.repeat(800) + '\\n');
+      }
+      process.stderr.write('fatal: custom stderr reason\\n', () => process.exit(1));
+    `
+    const failingStdio = new StdioUpstream({
+      name: 'noisy',
+      command: process.execPath,
+      args: ['--input-type=module', '-e', noisyStderrScript],
+    })
+
+    const hub = new McpHub().register(sseHttpServer).register(failingStdio)
+    try {
+      await hub.connectServer('sse_remote')
+      expect(httpToolsListCalls).toBe(1)
+
+      // Subsequent listTools calls reuse cachedTools without extra RPC roundtrips
+      await hub.listTools()
+      await hub.listCatalogTools()
+      expect(httpToolsListCalls).toBe(1)
+
+      const failed = await hub.connectServer('noisy')
+      expect(failed.state).toBe('failed')
+      expect(failed.lastError).toContain('fatal: custom stderr reason')
+
+      // API key verification: open when no keys exist, enforced once created
+      expect(hub.verifyApiKey(undefined)).toBe(true)
+      const { token } = hub.createApiKey('Test Runner')
+      expect(hub.verifyApiKey(undefined)).toBe(false)
+      expect(hub.verifyApiKey('Bearer wrong_token')).toBe(false)
+      expect(hub.verifyApiKey(`Bearer ${token}`)).toBe(true)
+      expect(hub.listApiKeys()[0]?.lastUsedAt).toEqual(expect.any(Number))
+    } finally {
+      await hub.closeAll()
+    }
+  })
 })

@@ -335,6 +335,21 @@ export class McpHub {
     return deleted
   }
 
+  verifyApiKey(token?: string): boolean {
+    if (this.apiKeys.size === 0) return true
+    if (!token) return false
+    const cleaned = token.replace(/^Bearer\s+/i, '').trim()
+    for (const [id, entry] of this.apiKeys.entries()) {
+      if (entry.rawKey === cleaned) {
+        const updated: GatewayApiKeyRecord = { ...entry.record, lastUsedAt: Date.now() }
+        this.apiKeys.set(id, { record: updated, rawKey: entry.rawKey })
+        this.storage?.upsertApiKey({ ...updated, rawKey: entry.rawKey })
+        return true
+      }
+    }
+    return false
+  }
+
   listLogs(limit = 100): GatewayCallLog[] {
     return this.logs.slice(0, limit)
   }

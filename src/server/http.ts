@@ -3,18 +3,48 @@ import { registerServerFromEntry, type GatewayServerEntry } from '../config.js'
 import type { JsonRpcRequest } from '../protocol/jsonrpc.js'
 import type { ExposureMode, McpHub, PolicyAction } from '../gateway/hub.js'
 
-async function readJsonBody<T>(req: IncomingMessage): Promise<T> {
-  const chunks: Buffer[] = []
-  for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+const MAX_JSON_BODY_BYTES = 10 * 1024 * 1024
+
+class HttpRequestError extends Error {
+  constructor(readonly statusCode: number, message: string) {
+    super(message)
   }
-  return JSON.parse(Buffer.concat(chunks).toString('utf8')) as T
 }
 
-function sendJson(res: ServerResponse, status: number, payload: unknown): void {
+async function readJsonBody<T>(req: IncomingMessage, maxBytes = MAX_JSON_BODY_BYTES): Promise<T> {
+  const chunks: Buffer[] = []
+  let total = 0
+  for await (const chunk of req) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    total += buf.length
+    if (total > maxBytes) {
+      throw new HttpRequestError(413, `Payload exceeds maximum size of ${maxBytes} bytes`)
+    }
+    chunks.push(buf)
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8')) as T
+  } catch {
+    throw new HttpRequestError(400, 'Malformed JSON request body')
+  }
+}
+
+function isAllowedOrigin(origin: string | undefined, host: string | undefined): boolean {
+  if (!origin) return true
+  try {
+    const parsed = new URL(origin)
+    if (!['localhost', '127.0.0.1', '[::1]'].includes(parsed.hostname)) return false
+    if (host && origin === `http://${host}`) return true
+    return ['3090', '4090', '5173'].includes(parsed.port)
+  } catch {
+    return false
+  }
+}
+
+function sendJson(res: ServerResponse, status: number, payload: unknown, origin?: string): void {
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin': '*',
+    ...(origin ? { 'Access-Control-Allow-Origin': origin, Vary: 'Origin' } : {}),
     'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Agent-Client',
   })
@@ -23,9 +53,32 @@ function sendJson(res: ServerResponse, status: number, payload: unknown): void {
 
 export function createGatewayServer(hub: McpHub): Server {
   return createServer(async (req, res) => {
+    const host = req.headers.host
+    if (host) {
+      let allowedHost = false
+      try {
+        const parsed = new URL(`http://${host}`)
+        allowedHost = ['localhost', '127.0.0.1', '[::1]'].includes(parsed.hostname)
+      } catch {
+        allowedHost = false
+      }
+      if (!allowedHost) {
+        res.writeHead(403)
+        res.end('Forbidden')
+        return
+      }
+    }
+
+    const origin = req.headers.origin
+    if (!isAllowedOrigin(origin, host) || req.headers['sec-fetch-site'] === 'cross-site') {
+      res.writeHead(403)
+      res.end('Forbidden')
+      return
+    }
+
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
-        'Access-Control-Allow-Origin': '*',
+        ...(origin ? { 'Access-Control-Allow-Origin': origin, Vary: 'Origin' } : {}),
         'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Agent-Client',
       })
@@ -36,6 +89,12 @@ export function createGatewayServer(hub: McpHub): Server {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
     const clientHeader = String(req.headers['x-agent-client'] ?? '')
     const userAgent = String(req.headers['user-agent'] ?? '')
+
+    const isProtectedEndpoint = url.pathname === '/mcp' || url.pathname === '/api/tools/call'
+    if (isProtectedEndpoint && !hub.verifyApiKey(req.headers.authorization)) {
+      sendJson(res, 401, { error: 'Unauthorized: valid API key required in Authorization header' }, origin)
+      return
+    }
 
     try {
       if (req.method === 'GET' && url.pathname === '/health') {
@@ -261,8 +320,9 @@ export function createGatewayServer(hub: McpHub): Server {
 
       sendJson(res, 404, { error: 'Not Found' })
     } catch (error) {
+      const status = error instanceof HttpRequestError ? error.statusCode : 500
       const message = error instanceof Error ? error.message : String(error)
-      sendJson(res, 500, { error: message })
+      sendJson(res, status, { error: message })
     }
   })
 }

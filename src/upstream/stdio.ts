@@ -35,6 +35,8 @@ export class StdioUpstream implements UpstreamServer {
   private nextId = 1
   private readonly pending = new Map<number | string, PendingRequest>()
   private cachedTools: readonly McpToolDefinition[] = []
+  private toolsLoaded = false
+  private stderrTail: string[] = []
   private connected = false
   private lastError: string | undefined
   private readonly timeoutMs: number
@@ -55,16 +57,33 @@ export class StdioUpstream implements UpstreamServer {
         stdio: ['pipe', 'pipe', 'pipe'],
       })
       this.child = child
+      this.stderrTail = []
 
-      child.on('exit', (code, sig) => {
+      child.stderr?.on('data', (chunk: Buffer | string) => {
+        const text = (Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)).trim()
+        if (!text) return
+        for (const line of text.split(/\r?\n/)) {
+          const trimmed = line.trim()
+          if (trimmed) {
+            const capped = trimmed.length > 240 ? `${trimmed.slice(0, 240)}...` : trimmed
+            this.stderrTail.push(capped)
+            if (this.stderrTail.length > 8) this.stderrTail.shift()
+          }
+        }
+      })
+
+      child.on('close', (code, sig) => {
         this.connected = false
-        const err = new Error(`Stdio MCP server "${this.name}" exited (code=${code}, signal=${sig})`)
+        this.toolsLoaded = false
+        const detail = this.stderrTail.length > 0 ? `: ${this.stderrTail.join(' | ')}` : ''
+        const err = new Error(`Stdio MCP server "${this.name}" exited (code=${code}, signal=${sig})${detail}`)
         this.lastError = err.message
         this.failAllPending(err)
       })
 
       child.on('error', err => {
         this.connected = false
+        this.toolsLoaded = false
         this.lastError = err.message
         this.failAllPending(err)
       })
@@ -85,7 +104,7 @@ export class StdioUpstream implements UpstreamServer {
       this.notify('notifications/initialized', {})
       this.connected = true
       this.lastError = undefined
-      await this.listTools(signal)
+      await this.listTools(signal, true)
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error)
       await this.close()
@@ -94,10 +113,15 @@ export class StdioUpstream implements UpstreamServer {
     }
   }
 
-  async listTools(signal?: AbortSignal): Promise<readonly McpToolDefinition[]> {
-    if (!this.connected) await this.connect(signal)
+  async listTools(signal?: AbortSignal, refresh = false): Promise<readonly McpToolDefinition[]> {
+    if (!this.connected) {
+      await this.connect(signal)
+      return this.cachedTools
+    }
+    if (this.toolsLoaded && !refresh) return this.cachedTools
     const res = (await this.request('tools/list', {}, signal)) as { tools?: McpToolDefinition[] }
     this.cachedTools = res.tools ?? []
+    this.toolsLoaded = true
     return this.cachedTools
   }
 
@@ -124,6 +148,7 @@ export class StdioUpstream implements UpstreamServer {
 
   async close(): Promise<void> {
     this.connected = false
+    this.toolsLoaded = false
     this.lastError = undefined
     this.rl?.close()
     this.rl = undefined
@@ -199,6 +224,10 @@ export class StdioUpstream implements UpstreamServer {
     try {
       msg = JSON.parse(trimmed) as JsonRpcMessage
     } catch {
+      return
+    }
+    if ('method' in msg && msg.method === 'notifications/tools/list_changed') {
+      this.toolsLoaded = false
       return
     }
     if (!('id' in msg) || msg.id === null || msg.id === undefined) return

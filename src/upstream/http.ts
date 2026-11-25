@@ -23,6 +23,7 @@ export class HttpUpstream implements UpstreamServer {
   private nextId = 1
   private sessionId: string | undefined
   private cachedTools: readonly McpToolDefinition[] = []
+  private toolsLoaded = false
   private connected = false
   private lastError: string | undefined
 
@@ -44,18 +45,24 @@ export class HttpUpstream implements UpstreamServer {
       )
       this.connected = true
       this.lastError = undefined
-      await this.listTools(signal)
+      await this.listTools(signal, true)
     } catch (error) {
       this.connected = false
+      this.toolsLoaded = false
       this.lastError = error instanceof Error ? error.message : String(error)
       throw error
     }
   }
 
-  async listTools(signal?: AbortSignal): Promise<readonly McpToolDefinition[]> {
-    if (!this.connected) await this.connect(signal)
+  async listTools(signal?: AbortSignal, refresh = false): Promise<readonly McpToolDefinition[]> {
+    if (!this.connected) {
+      await this.connect(signal)
+      return this.cachedTools
+    }
+    if (this.toolsLoaded && !refresh) return this.cachedTools
     const res = (await this.request('tools/list', {}, signal)) as { tools?: McpToolDefinition[] }
     this.cachedTools = res.tools ?? []
+    this.toolsLoaded = true
     return this.cachedTools
   }
 
@@ -82,6 +89,7 @@ export class HttpUpstream implements UpstreamServer {
 
   async close(): Promise<void> {
     this.connected = false
+    this.toolsLoaded = false
     this.lastError = undefined
     this.sessionId = undefined
   }
@@ -90,7 +98,7 @@ export class HttpUpstream implements UpstreamServer {
     const id = this.nextId++
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
-      Accept: 'application/json',
+      Accept: 'application/json, text/event-stream',
       ...this.config.headers,
       ...(this.sessionId ? { 'Mcp-Session-Id': this.sessionId } : {}),
     }
@@ -110,7 +118,33 @@ export class HttpUpstream implements UpstreamServer {
       throw new Error(`HTTP MCP server "${this.name}" error (${res.status}): ${text || res.statusText}`)
     }
 
-    const data = (await res.json()) as JsonRpcSuccess | JsonRpcError
+    const contentType = (res.headers.get('content-type') ?? '').toLowerCase()
+    let data: JsonRpcSuccess | JsonRpcError | undefined
+    if (contentType.includes('text/event-stream')) {
+      const raw = await res.text()
+      for (const frame of raw.replace(/\r\n/g, '\n').split('\n\n')) {
+        const dataLines = frame
+          .split('\n')
+          .filter(line => line.startsWith('data:'))
+          .map(line => line.slice(5).trimStart())
+        if (!dataLines.length) continue
+        const payload = dataLines.join('\n')
+        if (!payload || payload === '[DONE]') continue
+        const parsed = JSON.parse(payload) as Partial<JsonRpcSuccess & JsonRpcError & { method?: string }>
+        if (parsed.method === 'notifications/tools/list_changed') {
+          this.toolsLoaded = false
+        }
+        if ('id' in parsed && parsed.id === id) {
+          data = parsed as JsonRpcSuccess | JsonRpcError
+        }
+      }
+      if (!data) {
+        throw new Error(`HTTP MCP server "${this.name}" SSE stream ended without a response for request #${id}`)
+      }
+    } else {
+      data = (await res.json()) as JsonRpcSuccess | JsonRpcError
+    }
+
     if ('error' in data) {
       throw new Error(`MCP error (${data.error.code}): ${data.error.message}`)
     }
